@@ -1,0 +1,545 @@
+---
+title: "Nanostring Clinical Correlates 3"
+author: "Jenny Smith"
+date: "6/29/2017"
+output: html_document
+---
+
+
+Purpose: Use logistic regression for the association of clinical characteristics and Nanotring genes. 
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center')
+knitr::opts_knit$set(root.dir = '~/Nanostring_Analysis/2017.06.29_regressionAnalysis/')
+```
+
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+getwd()
+```
+
+```{r}
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/ggplot_Themes_Function.r")
+```
+
+
+#Read in the counts
+
+```{r}
+nSolverNorm.cts <- get(load("TARGET_AML_NanostringPanel_nSolverNorm_counts.RData"))
+head(nSolverNorm.cts[,1:5])
+```
+
+
+```{r}
+dim(nSolverNorm.cts)
+```
+
+```{r}
+BM <- grepl("^BM", colnames(nSolverNorm.cts))
+BM.cts <- nSolverNorm.cts[,BM]
+
+filterGenes <- get(load("NanotringPanel_63FilterGenes.RData"))
+```
+
+using predictors that have no relationship with the response tends to cause a deterioration in the test
+error rate (since such predictors cause an increase in variance without a corresponding decrease in bias)
+
+
+#Read in the clinical data
+
+```{r}
+clinData <- read.csv("TARGET_AML_NanostringPanel_Clean_CDE.csv", stringsAsFactors = FALSE, row.names = 1)
+head(clinData[,1:5])
+```
+
+
+
+#Merge the clinical data and the count data
+
+Focus on the EOI expression. 
+```{r}
+cols <- grep("\\.1", colnames(nSolverNorm.cts))
+
+cts <- t(nSolverNorm.cts[,cols]) %>% set_rownames(gsub("\\.1", "", rownames(.))) 
+
+merged <- transform(merge(clinData, cts, by=0), row.names=Row.names, Row.names=NULL)
+
+head(merged[,c(1:2,99:102)])
+```
+
+
+```{r}
+colors <- rainbow(3, s=0.5,v=0.85, start=0.5, end=0.8)
+colorCodes <- c(BM=colors[1], similarToBM=colors[2],AboveMaxBM=colors[3])
+```
+
+```{r}
+#32 out of 84 patients relapsed, yet did not HAVE detectable MRD.
+dim(merged %>%
+  filter(Relapse..Yes.or.no == "yes", MRD. == "no"))
+```
+
+Numeric Responses: 
+  MRD....EOI1 :
+  MRD....EOI2 : 
+  timeToEvent :
+  timeToDeath :
+  
+  
+#Univariate Logistic regression
+
+```{r}
+
+```
+
+
+#Multivariate Analysis
+
+```{r}
+library(glmnet)
+```
+
+```{r}
+glm.binom <- function(x,y,df,standardize=FALSE){
+  library(glmnet)
+  #df is the matrix with the response and  gene expression. Patietns as rownames.
+  #x is the expresion matrix, genes as rownames. 
+  
+  response <- y
+  predictors <- x
+  
+  y <- factor(df[,y])
+  x <- as.matrix(df[,x]) #NOTE: for categorical predictors data, should use model.matrix 
+  
+  if (any(is.na(y))){
+    print("There Are Missing Values.")
+    return(y)
+  }else if (length(levels(y)) > 2 ){
+    print("More tha two levels")
+    
+    sel <- grepl("yes|no", df[,response]) #select only the yes or no. 
+    df <- df[sel, ] #subset the df
+    
+    y <- factor(df[,response])
+    x <- as.matrix(df[,predictors])
+  }
+  
+  #Check the reference level of the response.
+  contrast <- contrasts(y)
+
+  #Use validation set approach. split observations into approx. equal groups.
+  set.seed(1) #changing this, see dramaticaly changes in results. THUS NEED an outer loop for sample cross-validation.  
+  train <- sample(c(TRUE,FALSE), nrow(x), replace = TRUE)
+  test <- (!train)
+
+  train.names <- rownames(df)[train]
+  test.names <- rownames(df)[test]
+
+  #grid of lambda values to test.
+  grid <- 10^ seq(10,-2, length=100)
+
+  #training model.
+  mod <- glmnet(x[train,], y[train],family = "binomial",
+                  standardize = standardize, lambda = grid, intercept = FALSE)
+
+  #use cross-validation on the training model.CV only for lambda
+  set.seed(1) 
+  cv.lamdba <- cv.glmnet(x[train,], y[train],family = "binomial",
+                  standardize = standardize, lambda = grid, nfolds = 5,
+                  type.measure = "deviance", intercept = FALSE)
+
+  #Select lambda min.
+  lambda.min <- cv.lamdba$lambda.min
+
+  #predict the classes
+  pred.class <- predict(mod, newx = x[test,], type="class", s=lambda.min)
+
+  #find the test error
+  tab <- table(pred.class,y[test])
+  testError <- mean(pred.class != y[test]) #how many predicted classes were incorrect
+
+  #Fit the full dataset.
+  final <- glmnet(x, y,family = "binomial",
+                  standardize = standardize, lambda = grid, intercept = FALSE)
+
+  #Extract the coefficients
+  coef <- predict(final, type="coefficients", s=lambda.min)
+  idx <- which(coef != 0)
+  nonZero <- coef[idx,]
+
+  list <- list(train.names, test.names, contrast, mod, cv.lamdba,testError, final, nonZero)
+  names(list) <- c("training.set", "testing.set","contrast", "train.model",
+                   "cv.train", "test.error", "final.model", "nonzero.coef")
+  return(list)
+  
+}
+```
+
+Nested cross-validation, where the outer cross-validation is used for performance estimation and the inner crossvalidation for model selection is a good basic approach.
+https://stats.stackexchange.com/questions/29354/can-you-overfit-by-training-machine-learning-algorithms-using-cv-bootstrap/29377#29377
+
+
+
+#Logistic Lasso Regression 
+
+NOTE: Lasso Degrees of Freedom
+The axis above indicates the number of nonzero coefficients at the current λλ, which is the effective degrees of freedom (df) for the lasso
+https://web.stanford.edu/~hastie/glmnet/glmnet_alpha.html#cox
+
+Binary Response Variables:
+
+  Relapse..Yes.or.no: 
+  MRD. :
+  LSC17_Group: 
+  LSC17_Quantile: 
+  CR.EOI1:  
+  CR.EOI2:  
+
+
+NOTE: here MRD is defined as above 3% blasts. 
+
+For binomial logistic regression, the response variable y should be either a factor with two levels, or a two-column matrix of counts or proportions.
+
+```{r}
+#Update the columns for input to glmnet
+# merged[,98:331] <- log2(merged[,98:331] + 1) #log2 transform
+# merged$CR.EOI1 <- ifelse(merged$CR.EOI1 == "CR", "yes", "no") #change classes
+# merged$CR.EOI2[merged$CR.EOI2 == "CR"] <- "yes"
+# merged$CR.EOI2[merged$CR.EOI2 == "Not in CR"] <- "no"
+```
+
+```{r}
+#Define the responses and the predictors
+responses <- c("Relapse..Yes.or.no","MRD.", "LSC17_Group", "CR.EOI1")
+expn <- c(98:331)
+```
+
+```{r}
+lapply(merged[,responses], table)
+```
+
+
+```{r}
+library(TANDEM)
+```
+
+
+
+NOTE: MRD and CR could have class bias (eg many more of one class than the other). This is problematic for the validation set approach because there is very few cases of each class in the train or test set. 
+
+Thus, to ammend this problem, you would sample only to the size of samples of the smallest class (eg 17 Nos in CR.EOI1). Of course, due to my small sample size in the beginning, this is not really a solution. But I might try it anyway. 
+
+http://r-statistics.co/Logistic-Regression-With-R.html
+
+
+```{r message=FALSE,warning=FALSE}
+logisticMods <- lapply(responses, glm.binom, x=expn, df=merged) %>% set_names(responses)
+
+summary(logisticMods)
+```
+
+Warnings:
+one multinomial or binomial class has fewer than 8  observations;dangerous ground
+one multinomial or binomial class has 1 or 0 observations; not allowed == CR.EOI2 (only two no's,and 3 unevaluables which are removed)
+
+No way to fix warnings. Its due to the class bias mentioned above, where there will be very few observations in the smaller classes in 5 folds (eg each group of ~16 patient samples will have ~4 observations of the smallest class)
+
+#Relapse 
+
+```{r}
+length(logisticMods$Relapse..Yes.or.no$training.set)
+length(logisticMods$Relapse..Yes.or.no$testing.set)
+```
+
+
+```{r}
+logisticMods$Relapse..Yes.or.no$contrast
+```
+
+```{r}
+# pdf(file="Relapse_glmnet_DevianceVsLambda_plot_nointercept.pdf")
+plot(logisticMods$Relapse..Yes.or.no$cv.train)
+# dev.off()
+```
+
+Deviance: 
+in the source code for function cvlognet, the deviance residuals for the response are calculated as
+-2*((y==2)*log(predmat)+(y==1)*log(1-predmat))
+predmat is the predicted matrix. 
+
+```{r}
+logisticMods$Relapse..Yes.or.no$test.error
+```
+
+45.0% test error (55% in the test set were correctly identified as thier class)
+
+```{r}
+logisticMods$Relapse..Yes.or.no$nonzero.coef
+```
+
+
+#MRD
+
+```{r}
+length(logisticMods$MRD.$training.set)
+length(logisticMods$MRD.$testing.set)
+```
+
+Since I set the seed for train and test, the same patiens were selected for all analyses. 
+
+```{r}
+logisticMods$MRD.$contrast
+```
+
+
+```{r}
+# pdf(file = "MRD_glmnet_DevianceVsLambda_plot_noIntercept.pdf")
+plot(logisticMods$MRD.$cv.train)
+# dev.off()
+```
+
+```{r}
+logisticMods$MRD.$test.error
+```
+
+30.0% misclassified. 
+
+```{r}
+table.class <- function(x,y,df,mod){
+  min <- mod$cv.train$lambda.min
+  test <- mod$testing.set
+  train.mod <- mod$train.model
+  newmat <- as.matrix(df[test, x])
+  
+  pred.class <- predict(train.mod, newx=newmat, type="class", s=min)
+  pred.probs <- predict(train.mod, newx=newmat, type="response", s=min)
+
+  
+  res <- data.frame(Predicted=as.character(pred.class), 
+                    true=df[test, y])
+  
+  pred.probs <- data.frame(Patient=rownames(pred.probs),
+                           PredProbs=as.numeric(pred.probs))
+  
+  list <- list(res,pred.probs)
+  names(list) <- c("df", "prob")
+  return(list)
+}
+```
+
+
+```{r}
+res.mrd <- table.class(x=expn, y="MRD.", df=merged, logisticMods$MRD.)
+```
+
+Only 1/4 MRD positive (yes) were correctly classified using the 0.5 probability threshold. 
+
+```{r}
+# pdf(file="MRD_predProb_Histogram.pdf", height = 5, width = 5)
+ggplot(res.mrd$prob, aes(PredProbs)) + 
+  geom_histogram(binwidth = 0.1, fill="grey") + 
+  lims(x=c(0,1.0)) +
+  geom_vline(xintercept = 0.5, linetype=3, col="red") +
+  theme_numX
+# dev.off()
+
+```
+
+
+```{r}
+logisticMods$MRD.$nonzero.coef
+```
+
+```{r}
+mrd.df <- data.frame(coef=logisticMods$MRD.$nonzero.coef,
+           term=names(logisticMods$MRD.$nonzero.coef))
+# pdf(file="MRD_Coeff_Barplot.pdf", height = 5, width=6)
+ggplot(mrd.df, aes(x=reorder(mrd.df$term, mrd.df$coef), y=coef)) +
+  geom_bar(stat="identity") + theme_JS +
+  labs(title="Genes Associated with MRD", y="Coeffecient", x="")
+# dev.off()
+```
+
+
+#Complete Remission
+
+```{r}
+logisticMods$CR.EOI1$contrast
+```
+
+```{r}
+# pdf(file="CR.EOI1_DevianceVsLambda_plot_noIntercept.pdf")
+plot(logisticMods$CR.EOI1$cv.train)
+# dev.off()
+```
+
+```{r}
+logisticMods$CR.EOI1$test.error
+```
+
+22.5% misclassification
+
+```{r}
+res <- table.class(x=expn, y="CR.EOI1", df=merged, logisticMods$CR.EOI1)
+table(res$df)
+```
+
+Dismal. Out of 8 "no" CR classes in the test data, zero were classified correctly...
+
+
+```{r}
+# pdf(file="CR.EOI_predProbs_hist.pdf", height = 5, width = 5)
+ggplot(res$prob, aes(PredProbs)) +
+  geom_histogram(binwidth = 0.1, fill="grey") + 
+  lims(x=c(0,1.0)) +
+  geom_vline(xintercept = 0.5, linetype=3, col="red") +
+  theme_numX
+# dev.off()
+```
+
+
+```{r}
+logisticMods$CR.EOI1$nonzero.coef
+```
+
+```{r}
+cr.df <- data.frame(coef=logisticMods$CR.EOI1$nonzero.coef,
+                    term=names(logisticMods$CR.EOI1$nonzero.coef))
+# cr.df
+# pdf("GenesAssociated_CR_Coef_barplot.pdf", height = 5, width = 6)
+ggplot(cr.df, aes(x=reorder(cr.df$term, cr.df$coef), y=coef)) + 
+  geom_bar(stat="identity") + theme_JS +
+  labs(title="Genes Associated with CR", y="Coeffecient", x="")
+# dev.off()
+```
+
+
+#LSC17 
+
+```{r}
+logisticMods$LSC17_Group$contrast
+```
+
+```{r}
+plot(logisticMods$LSC17_Group$cv.train)
+```
+
+
+```{r}
+logisticMods$LSC17_Group$test.error
+```
+
+45% test error. 
+
+```{r}
+logisticMods$LSC17_Group$nonzero.coef
+```
+
+
+#Logistic Regression with Filtered Genes
+
+
+```{r warning=FALSE,message=FALSE}
+filterMods <- lapply(responses, glm.binom, x=filterGenes, df=merged) %>% set_names(responses)
+
+summary(filterMods)
+```
+
+Warning:
+one multinomial or binomial class has fewer than 8  observations; dangerous groundone multinomial
+
+#Relapse
+
+```{r}
+plot(filterMods$Relapse..Yes.or.no$cv.train)
+```
+
+```{r}
+filterMods$Relapse..Yes.or.no$test.error
+```
+
+
+```{r}
+filterMods$Relapse..Yes.or.no$nonzero.coef
+```
+
+
+#MRD
+
+```{r}
+plot(filterMods$MRD.$cv.train)
+```
+
+```{r}
+filterMods$MRD.$test.error
+```
+
+```{r}
+res <- table.class(x=filterGenes, y="MRD.", df=merged, filterMods$MRD.)
+table(res$true)
+```
+
+```{r}
+table(res$Predicted)
+```
+
+```{r}
+table(res$df)
+```
+
+
+1/10 predicted "MRD" correctly
+
+```{r}
+filterMods$MRD.$nonzero.coef
+```
+
+#CR
+
+```{r}
+plot(filterMods$CR.EOI1$cv.train)
+
+```
+
+
+```{r}
+cr.pred <- table.class(x=filterGenes, y="CR.EOI1", df=merged, filterMods$CR.EOI1)
+
+table(cr.pred$df)
+```
+
+2/5 predcited "Not in CR" predicted
+
+```{r}
+filterMods$CR.EOI1$nonzero.coef
+
+```
+
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
